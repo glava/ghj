@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# ghfzf — fuzzy-search GitHub repos you have access to.
+#
+# Requires: gh (authenticated), git, fzf, jq.
+#
+# Default behavior: pick a repo interactively, make sure it's checked out
+# under ~/<owner>/<repo> (clone via SSH if missing), then print the absolute
+# path to stdout. Combined with the `ghj` fish function (see ghj.fish) this
+# lets you `cd` straight into any repo you have access to on GitHub.
+# Install both with ./install.fish.
+#
+# Usage:
+#   ghfzf                   # pick -> ensure checkout -> print path  (default)
+#   ghfzf --print-path      # same as default, explicit
+#   ghfzf --print           # print selection (owner/repo) to stdout, no clone
+#   ghfzf --open            # open selection in browser (old default)
+#   ghfzf --clone           # clone selection into ~/<owner>/<repo> and print
+#   ghfzf --ensure <repo>   # non-interactive: ensure checkout of owner/repo
+#   ghfzf -r, --refresh     # force-refresh the repo cache before picking
+#   ghfzf --list            # just print the cached repo list (one per line)
+#   ghfzf --help
+#
+# Checkout layout: ~/<owner>/<repo> (e.g. ~/acme/api, ~/alice/dotfiles).
+# Override the parent directory with $GHFZF_ROOT (then the full path becomes
+# $GHFZF_ROOT/<owner>/<repo>).
+#
+# Cache: ~/.cache/ghfzf/repos.json  (refreshed if older than $GHFZF_TTL seconds,
+#        default 86400 = 24h). Delete it or pass -r / --refresh to force one.
+
+set -euo pipefail
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ghfzf"
+CACHE_FILE="$CACHE_DIR/repos.json"
+TTL="${GHFZF_TTL:-86400}"
+
+# ANSI escape sequences used to color the picker output. We build the palette
+# once and pass it to jq via env vars so the jq programs stay readable.
+# Respect the NO_COLOR convention: https://no-color.org/.
+esc=$'\033'
+if [ -z "${NO_COLOR:-}" ]; then
+    C_RESET="${esc}[0m"
+    C_NAME="${esc}[1;36m"       # bold cyan            — repo basename
+    C_OWNER="${esc}[38;5;244m"  # soft gray            — owner (secondary)
+    C_DESC="${esc}[38;5;250m"   # light gray           — description
+    C_ARCHIVED="${esc}[2;90m"   # dim + dark-gray      — archived repos
+    C_HEADER="${esc}[1;4;37m"   # bold underlined      — column header
+    # Language palette, GitHub-ish, mapped by name below.
+    C_LANG_SCALA="${esc}[38;5;88m"   # deep red
+    C_LANG_JAVA="${esc}[38;5;130m"   # orange
+    C_LANG_KOTLIN="${esc}[38;5;141m" # purple
+    C_LANG_GO="${esc}[38;5;81m"      # cyan/blue
+    C_LANG_PY="${esc}[38;5;220m"     # yellow/gold
+    C_LANG_RUBY="${esc}[38;5;160m"   # ruby red
+    C_LANG_TS="${esc}[38;5;33m"      # blue
+    C_LANG_JS="${esc}[38;5;227m"     # soft yellow
+    C_LANG_RUST="${esc}[38;5;166m"   # rust orange
+    C_LANG_SHELL="${esc}[38;5;148m"  # green
+    C_LANG_HCL="${esc}[38;5;135m"    # violet
+    C_LANG_MAKE="${esc}[38;5;244m"   # gray
+    C_LANG_HTML="${esc}[38;5;202m"   # orange-red
+    C_LANG_CSS="${esc}[38;5;75m"     # sky blue
+    C_LANG_C="${esc}[38;5;248m"      # light gray
+    C_LANG_SWIFT="${esc}[38;5;208m"  # orange
+    C_LANG_NB="${esc}[38;5;214m"     # jupyter orange
+    C_LANG_LOOK="${esc}[38;5;171m"   # pink
+    C_LANG_DASH="${esc}[38;5;240m"   # very dim for "-"
+else
+    C_RESET=""; C_NAME=""; C_OWNER=""; C_DESC=""; C_ARCHIVED=""; C_HEADER=""
+    C_LANG_SCALA=""; C_LANG_JAVA=""; C_LANG_KOTLIN=""; C_LANG_GO=""
+    C_LANG_PY=""; C_LANG_RUBY=""; C_LANG_TS=""; C_LANG_JS=""; C_LANG_RUST=""
+    C_LANG_SHELL=""; C_LANG_HCL=""; C_LANG_MAKE=""; C_LANG_HTML=""
+    C_LANG_CSS=""; C_LANG_C=""; C_LANG_SWIFT=""; C_LANG_NB=""; C_LANG_LOOK=""
+    C_LANG_DASH=""
+fi
+
+die() { printf 'ghfzf: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+require() {
+    command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+require gh
+require git
+require fzf
+require jq
+
+action="print-path"
+force_refresh=0
+ensure_target=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)     usage; exit 0 ;;
+        --open)        action="open" ;;
+        --clone)       action="clone" ;;
+        --print)       action="print" ;;
+        --print-path)  action="print-path" ;;
+        --ensure)      action="ensure"; shift; ensure_target="${1:-}"
+                       [ -n "$ensure_target" ] || die "--ensure requires owner/repo"
+                       ;;
+        --list)        action="list" ;;
+        --rows)        action="rows" ;;   # internal: used by ctrl-r reload
+        -r|--refresh)  force_refresh=1 ;;
+        --)            shift; break ;;
+        -*)            die "unknown option: $1 (see --help)" ;;
+        *)             die "unexpected argument: $1" ;;
+    esac
+    shift
+done
+
+# Parent dir for checkouts. Final path is always $CHECKOUT_ROOT/<owner>/<repo>.
+CHECKOUT_ROOT="${GHFZF_ROOT:-$HOME}"
+
+# Ensure owner/repo is cloned under $CHECKOUT_ROOT/<owner>/<repo> and echo the
+# absolute path to stdout. All log output goes to stderr so callers can
+# capture stdout cleanly (e.g. `cd "$(ghfzf --print-path)"`).
+ensure_repo() {
+    local full="$1"
+    case "$full" in
+        */*) : ;;
+        *)   die "expected owner/repo, got: $full" ;;
+    esac
+    local owner="${full%%/*}"
+    local name="${full#*/}"
+    local dir="$CHECKOUT_ROOT/$owner/$name"
+
+    if [ -d "$dir/.git" ]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    if [ -e "$dir" ]; then
+        die "$dir exists but is not a git checkout"
+    fi
+
+    mkdir -p "$CHECKOUT_ROOT/$owner"
+    printf 'ghfzf: cloning %s into %s ...\n' "$full" "$dir" >&2
+    # Force SSH by passing the explicit git@github.com URL; this bypasses gh's
+    # HTTPS-vs-SSH protocol preference entirely.
+    if ! git -C "$CHECKOUT_ROOT/$owner" clone --quiet \
+            "git@github.com:${owner}/${name}.git" "$name" >&2; then
+        die "git clone failed for $full"
+    fi
+    printf '%s\n' "$dir"
+}
+
+if [ "$action" = "ensure" ]; then
+    ensure_repo "$ensure_target"
+    exit 0
+fi
+
+mkdir -p "$CACHE_DIR"
+
+cache_is_fresh() {
+    [ -s "$CACHE_FILE" ] || return 1
+    [ "$force_refresh" -eq 0 ] || return 1
+    local now mtime age
+    now=$(date +%s)
+    mtime=$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+    age=$((now - mtime))
+    [ "$age" -lt "$TTL" ]
+}
+
+# Fetch every repo the authenticated user can see (owned, collaborator, org
+# member). The GraphQL `viewer.repositories` with affiliations covers all three
+# at once, with cursor-based pagination.
+fetch_repos() {
+    local query tmp
+    query='
+    query($endCursor: String) {
+      viewer {
+        repositories(
+          first: 100,
+          after: $endCursor,
+          affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER],
+          ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER],
+          orderBy: {field: PUSHED_AT, direction: DESC}
+        ) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            nameWithOwner
+            description
+            isPrivate
+            isArchived
+            isFork
+            stargazerCount
+            primaryLanguage { name }
+            pushedAt
+            url
+            defaultBranchRef { name }
+          }
+        }
+      }
+    }'
+    # BSD mktemp (macOS) requires the trailing X's to be the *last* characters
+    # of the template, so we use repos.XXXXXX (no .json suffix) and rely on the
+    # trap below to clean up on any exit path.
+    tmp=$(mktemp "$CACHE_DIR/repos.XXXXXX") || die "mktemp failed in $CACHE_DIR"
+    trap 'rm -f "$tmp"' EXIT INT TERM
+    # gh api --paginate handles $endCursor automatically when the query exposes
+    # a pageInfo with endCursor. Each page is a separate JSON doc; merge the
+    # `nodes` arrays with jq -s.
+    if ! gh api graphql --paginate -f query="$query" \
+            --jq '.data.viewer.repositories.nodes[]' > "$tmp"; then
+        die "failed to fetch repos from GitHub (is 'gh auth status' OK?)"
+    fi
+    # `--jq` above emitted one JSON object per line; wrap into a JSON array so
+    # downstream consumers can slurp it. Write atomically via a sibling temp +
+    # mv so a concurrent reader never sees a half-written cache.
+    jq -s '.' "$tmp" > "$tmp.json"
+    mv -f "$tmp.json" "$CACHE_FILE"
+    rm -f "$tmp"
+    trap - EXIT INT TERM
+}
+
+if ! cache_is_fresh; then
+    printf 'ghfzf: refreshing repo cache...\n' >&2
+    fetch_repos
+fi
+
+# Column widths for the aligned display.
+NAME_W=36   # repo basename (the part after the slash)
+OWNER_W=20  # repo owner (the part before the slash)
+LANG_W=12
+
+# Build the fzf input: one line per repo, TAB-separated.
+# Columns:
+#   1 = repo basename    (padded + colored; visible)
+#   2 = repo owner       (padded + colored; visible)
+#   3 = primary language (padded + color-coded by language; visible)
+#   4 = description      (colored; dimmed when archived; visible)
+#   5 = json blob        (hidden; used only for the preview pane)
+#   6 = plain nameWithOwner  (hidden; used by --list, action dispatch,
+#                             ctrl-o/ctrl-y bindings — ANSI-free)
+#
+# Why split the repo into basename+owner: fzf scores matches that start at
+# position 0 of a matchable field much higher than mid-string matches. By
+# making the basename column 1 we guarantee that a query which appears in
+# the repo's short name (e.g. "kubernetes") matches at the very start and so
+# outranks any mid-description match. Default fuzzy (subsequence) matching
+# is left on, so typos like "knits" still find "kubernetes".
+#
+# Padding happens before color codes are inserted, so column widths are
+# based on visible character length, not byte length.
+build_lines() {
+    NAME_W="$NAME_W" OWNER_W="$OWNER_W" LANG_W="$LANG_W" \
+    C_RESET="$C_RESET" C_NAME="$C_NAME" C_OWNER="$C_OWNER" C_DESC="$C_DESC" \
+    C_ARCHIVED="$C_ARCHIVED" \
+    C_LANG_SCALA="$C_LANG_SCALA" C_LANG_JAVA="$C_LANG_JAVA" \
+    C_LANG_KOTLIN="$C_LANG_KOTLIN" C_LANG_GO="$C_LANG_GO" \
+    C_LANG_PY="$C_LANG_PY" C_LANG_RUBY="$C_LANG_RUBY" \
+    C_LANG_TS="$C_LANG_TS" C_LANG_JS="$C_LANG_JS" \
+    C_LANG_RUST="$C_LANG_RUST" C_LANG_SHELL="$C_LANG_SHELL" \
+    C_LANG_HCL="$C_LANG_HCL" C_LANG_MAKE="$C_LANG_MAKE" \
+    C_LANG_HTML="$C_LANG_HTML" C_LANG_CSS="$C_LANG_CSS" \
+    C_LANG_C="$C_LANG_C" C_LANG_SWIFT="$C_LANG_SWIFT" \
+    C_LANG_NB="$C_LANG_NB" C_LANG_LOOK="$C_LANG_LOOK" \
+    C_LANG_DASH="$C_LANG_DASH" \
+    jq -r '
+        ($ENV.NAME_W  | tonumber) as $nw
+        | ($ENV.OWNER_W | tonumber) as $ow
+        | ($ENV.LANG_W  | tonumber) as $lw
+        | def pad($s; $w):
+            ($s // "")
+            | if   length > $w then .[0:$w-1] + "…"
+              else              . + (" " * ($w - length))
+              end;
+          def wrap($c; $s): $c + $s + $ENV.C_RESET;
+          def lang_color($l):
+            {
+              "Scala":            $ENV.C_LANG_SCALA,
+              "Java":             $ENV.C_LANG_JAVA,
+              "Kotlin":           $ENV.C_LANG_KOTLIN,
+              "Go":               $ENV.C_LANG_GO,
+              "Python":           $ENV.C_LANG_PY,
+              "Ruby":             $ENV.C_LANG_RUBY,
+              "TypeScript":       $ENV.C_LANG_TS,
+              "JavaScript":       $ENV.C_LANG_JS,
+              "Rust":             $ENV.C_LANG_RUST,
+              "Shell":            $ENV.C_LANG_SHELL,
+              "HCL":              $ENV.C_LANG_HCL,
+              "Makefile":         $ENV.C_LANG_MAKE,
+              "HTML":             $ENV.C_LANG_HTML,
+              "CSS":              $ENV.C_LANG_CSS,
+              "C":                $ENV.C_LANG_C,
+              "Swift":            $ENV.C_LANG_SWIFT,
+              "Jupyter Notebook": $ENV.C_LANG_NB,
+              "LookML":           $ENV.C_LANG_LOOK,
+              "-":                $ENV.C_LANG_DASH
+            }[$l] // $ENV.C_DESC;
+        .[]
+        | (.nameWithOwner | split("/")) as $parts
+        | ((.primaryLanguage.name // "-")) as $lang
+        | (.isArchived) as $archived
+        | [
+            wrap($ENV.C_NAME;  pad($parts[1]; $nw)),
+            wrap($ENV.C_OWNER; pad($parts[0]; $ow)),
+            wrap(lang_color($lang); pad($lang; $lw)),
+            wrap((if $archived then $ENV.C_ARCHIVED else $ENV.C_DESC end);
+                 ((.description // "") | gsub("[\t\n]"; " "))),
+            (tojson),
+            .nameWithOwner
+          ]
+        | @tsv
+    ' "$CACHE_FILE"
+}
+
+# A sticky header row rendered with the same widths as the data rows so the
+# columns line up. fzf's --header-lines=1 pins it above the results. We wrap
+# each cell with the header color code so the whole row reads as one unit.
+build_header() {
+    NAME_W="$NAME_W" OWNER_W="$OWNER_W" LANG_W="$LANG_W" \
+    C_HEADER="$C_HEADER" C_RESET="$C_RESET" \
+    jq -rn '
+        ($ENV.NAME_W  | tonumber) as $nw
+        | ($ENV.OWNER_W | tonumber) as $ow
+        | ($ENV.LANG_W  | tonumber) as $lw
+        | def pad($s; $w):
+            $s | if length > $w then .[0:$w] else . + (" " * ($w - length)) end;
+          def wrap($s): $ENV.C_HEADER + $s + $ENV.C_RESET;
+        [
+          wrap(pad("REPO"; $nw)),
+          wrap(pad("OWNER"; $ow)),
+          wrap(pad("LANG"; $lw)),
+          wrap("DESCRIPTION"),
+          "",
+          ""
+        ] | @tsv
+    '
+}
+
+if [ "$action" = "list" ]; then
+    # Print one plain nameWithOwner per line (hidden col 6, ANSI-free).
+    build_lines | awk -F'\t' '{ print $6 }'
+    exit 0
+fi
+
+if [ "$action" = "rows" ]; then
+    # Internal: emit the TSV rows fzf consumes. Used by the ctrl-r reload bind.
+    build_lines
+    exit 0
+fi
+
+# Preview pane rendering: colored labels on the left, values plain. We inline
+# the escape codes literally (single-quoted bash string -> jq -r) instead of
+# chaining through env vars to keep things readable. fzf's --preview runs the
+# command fresh for each selection, so we get ANSI rendering automatically
+# because --ansi is set on the picker.
+preview_cmd='
+echo {5} | jq -r "
+  \"\u001b[1;36mRepo:        \u001b[0m\" + .nameWithOwner,
+  \"\u001b[1;36mURL:         \u001b[0m\" + .url,
+  \"\u001b[1;36mVisibility:  \u001b[0m\"
+    + (if .isPrivate then \"\u001b[0;33mprivate\u001b[0m\" else \"\u001b[0;32mpublic\u001b[0m\" end)
+    + (if .isArchived then \" \u001b[2;90m(archived)\u001b[0m\" else \"\" end)
+    + (if .isFork     then \" \u001b[0;35m(fork)\u001b[0m\"     else \"\" end),
+  \"\u001b[1;36mLanguage:    \u001b[0m\" + (.primaryLanguage.name // \"-\"),
+  \"\u001b[1;36mStars:       \u001b[0m\" + (.stargazerCount | tostring),
+  \"\u001b[1;36mPushed:      \u001b[0m\" + .pushedAt,
+  \"\u001b[1;36mDefault:     \u001b[0m\" + (.defaultBranchRef.name // \"-\"),
+  \"\",
+  \"\u001b[1;4;37mDescription\u001b[0m\",
+  (.description // \"\u001b[2;90m(none)\u001b[0m\")
+"
+'
+
+# Keybinding hints shown on a second header line, below the column header.
+keys_hint="enter: open/clone in ~ · ctrl-o: browser · ctrl-y: copy url · ctrl-r: refresh · prefix term with ' for exact"
+
+# Absolute path to this script so the ctrl-r reload binding works regardless of
+# the cwd fzf's subshell is spawned in.
+if command -v realpath >/dev/null 2>&1; then
+    script=$(realpath "$0")
+else
+    script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+fi
+
+selection=$(
+    { build_header; build_lines; } \
+    | fzf \
+        --ansi \
+        --delimiter=$'\t' \
+        --with-nth=1,2,3,4 \
+        --nth=1,2,4 \
+        --tiebreak=begin,length \
+        --header-lines=1 \
+        --header="$keys_hint" \
+        --preview="$preview_cmd" \
+        --preview-window='right,55%,wrap' \
+        --bind="ctrl-o:execute-silent(echo {5} | jq -r .url | xargs -I{} gh browse -R {})" \
+        --bind="ctrl-y:execute-silent(echo {5} | jq -r .url | pbcopy)+change-header(copied url to clipboard)" \
+        --bind="ctrl-r:reload($script --refresh --rows)" \
+    || true
+)
+
+[ -n "$selection" ] || exit 0
+
+# Col 6 is the plain ANSI-free "owner/repo"; col 5 is the JSON blob.
+repo=$(printf '%s\n' "$selection" | awk -F'\t' '{ print $6 }')
+url=$(printf '%s\n'  "$selection" | cut -f5 | jq -r .url)
+
+case "$action" in
+    print-path) ensure_repo "$repo" ;;
+    clone)      ensure_repo "$repo" ;;
+    open)       gh browse -R "$repo" ;;
+    print)      printf '%s\n' "$repo" ;;
+    *)          die "unknown action: $action" ;;
+esac
