@@ -1,0 +1,15 @@
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local caches the tool writes into $XDG_CACHE_HOME; should never land in
+# the repo, but ignore them if a user points the cache here by mistake.
+repos.json
+repos.*.json
+.cache/
+
+# Do not commit user-specific config
+.env
+.env.*
