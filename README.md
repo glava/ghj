@@ -30,8 +30,8 @@ type `ghj`, fuzzy-search, enter.
 - **Color-coded.** Repo name in bold cyan, owner in soft gray, language
   tinted per-language (GitHub-ish palette), archived repos dimmed so they
   recede. Respects `NO_COLOR`.
-- **Cached.** Refreshes the repo list once a day by default (`GHFZF_TTL`
-  to override, `-r` / `--refresh` or `Ctrl-R` in the picker to force).
+- **Cached.** Uses a local cache; never refreshes it implicitly. Run
+  `ghj fetch` (or `ghfzf --fetch`) when you want to update it.
 - **Fish-first.** Installer is `install.fish`; `ghj` is a native fish
   autoloaded function. (The core `ghfzf` tool works from any shell; it's
   just the `cd`-the-parent-shell part that's fish-specific.)
@@ -54,6 +54,8 @@ gh auth login -s repo,read:org -p ssh
 
 ## Install
 
+### fish
+
 ```fish
 ./install.fish
 ```
@@ -73,13 +75,19 @@ and changes take effect immediately, no reinstall. Pass `./install.fish
 
 Open a new fish shell (or `exec fish`) and you're ready.
 
+### bash / zsh
+
+```bash
+./install.sh --bash   # or: --zsh, or both
+```
+
 ## Use
 
 ### The everyday flow
 
 ```fish
+ghj fetch            # fetch/update the repo cache (run whenever you need it)
 ghj                  # fuzzy-pick -> cd into the checkout (clones if missing)
-ghj -r               # same, but refresh the repo cache first (alias: --refresh)
 ```
 
 ### All `ghfzf` options
@@ -91,6 +99,7 @@ ghfzf --print           # pick -> print "owner/repo", no clone
 ghfzf --open            # pick -> open in browser
 ghfzf --clone           # pick -> clone into ~/<owner>/<repo> (and print)
 ghfzf --ensure owner/r  # non-interactive: ensure checkout, print path
+ghfzf --fetch           # fetch & write repo cache, then exit
 ghfzf -r                # force-refresh the repo cache (alias: --refresh)
 ghfzf --list            # print the cached repo list (plain "owner/repo" per line)
 ghfzf --help
@@ -132,7 +141,6 @@ of `$HOME`. The `<owner>/<repo>` structure still applies:
 | Var           | Default            | Purpose                                                   |
 | ------------- | ------------------ | --------------------------------------------------------- |
 | `GHFZF_ROOT`  | `$HOME`            | Parent dir for checkouts; final path is `$ROOT/<owner>/<repo>` |
-| `GHFZF_TTL`   | `86400`            | Cache freshness, in seconds (default 24h)                 |
 | `NO_COLOR`    | unset              | Disable all ANSI coloring (follows <https://no-color.org>) |
 | `XDG_CACHE_HOME` | `$HOME/.cache`  | Where the repo cache is stored (`$XDG_CACHE_HOME/ghfzf/`) |
 
@@ -162,19 +170,8 @@ A few implementation details worth knowing if you want to tweak it:
 
 A child process can't change its parent shell's working directory, so
 `ghj` has to be a **function in your shell**, not a separate binary. I use
-fish, so `ghj.fish` is what's in the repo. Porting to zsh/bash is
-four lines:
-
-```bash
-ghj() {
-    local path
-    path=$(command ghfzf --print-path "$@") || return $?
-    [ -n "$path" ] || return 0
-    cd "$path"
-}
-```
-
-Drop that in your `~/.zshrc` / `~/.bashrc` and you're done.
+fish, so `ghj.fish` is what's in the repo. For bash/zsh, this repo ships
+`ghj.sh` (and `install.sh` wires it into your rc file).
 
 ## Files in this repo
 
@@ -182,14 +179,15 @@ Drop that in your `~/.zshrc` / `~/.bashrc` and you're done.
 | --------------- | -------------------------------------------------------------------------- |
 | `ghfzf`         | The main script: fetches, caches, picks, clones, prints paths              |
 | `ghj.fish`      | Fish function that runs `cd "$(ghfzf --print-path $argv)"`                 |
+| `ghj.sh`        | bash/zsh function wrapper (source it from your rc file)                    |
 | `install.fish`  | One-shot installer (dep check, symlinks, `fish_user_paths`)                |
+| `install.sh`    | One-shot installer for bash/zsh                                            |
 | `README.md`     | This file                                                                  |
 
 ## Troubleshooting
 
 **"I'm getting stale results."**
-The repo list is cached for a day. Press `Ctrl-R` in the picker or run
-`ghj -r` / `ghfzf -r` (or `--refresh`).
+Run `ghj fetch` (or `ghfzf --fetch`). You can also press `Ctrl-R` in the picker.
 
 **"Repository not found" on clone.**
 Three usual causes:
@@ -199,10 +197,9 @@ Three usual causes:
    from the org since the last cache refresh).
 
 **"The picker is slow on the first run."**
-Expected. The first `ghfzf` call with a cold cache makes one paginated
-GraphQL request to fetch every repo you can see. For accounts with
-1000+ repos that's 20-60s. All subsequent picks use the local cache and
-open instantly.
+Expected. The initial `ghj fetch` / `ghfzf --fetch` makes one paginated GraphQL
+request to fetch every repo you can see. For accounts with 1000+ repos that's
+20-60s. All subsequent picks use the local cache and open instantly.
 
 **"I want plain output for piping."**
 `NO_COLOR=1 ghfzf --list` — one `owner/repo` per line, no ANSI.

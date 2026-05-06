@@ -139,5 +139,5 @@ echo "  • function: $dst_fn"
 echo
 echo "Open a new fish shell (or run `exec fish`), then try:"
 echo "    ghj                # fuzzy-pick a repo and jump into it"
-echo "    ghj --refresh      # refresh the repo cache first"
+echo "    ghj fetch          # fetch/update the repo cache"
 echo "    ghfzf --help       # all ghfzf options"
