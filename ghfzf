@@ -16,6 +16,7 @@
 #   ghfzf --open            # open selection in browser (old default)
 #   ghfzf --clone           # clone selection into ~/<owner>/<repo> and print
 #   ghfzf --ensure <repo>   # non-interactive: ensure checkout of owner/repo
+#   ghfzf --fetch           # fetch & write repo cache, then exit
 #   ghfzf -r, --refresh     # force-refresh the repo cache before picking
 #   ghfzf --list            # just print the cached repo list (one per line)
 #   ghfzf --help
@@ -24,14 +25,14 @@
 # Override the parent directory with $GHFZF_ROOT (then the full path becomes
 # $GHFZF_ROOT/<owner>/<repo>).
 #
-# Cache: ~/.cache/ghfzf/repos.json  (refreshed if older than $GHFZF_TTL seconds,
-#        default 86400 = 24h). Delete it or pass -r / --refresh to force one.
+# Cache: ~/.cache/ghfzf/repos.json  (never refreshed implicitly).
+#        Run `ghfzf --fetch` (or `ghj fetch` in supported shells) to update it.
+#        Pass -r / --refresh to refresh before opening the picker.
 
 set -euo pipefail
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ghfzf"
 CACHE_FILE="$CACHE_DIR/repos.json"
-TTL="${GHFZF_TTL:-86400}"
 
 # ANSI escape sequences used to color the picker output. We build the palette
 # once and pass it to jq via env vars so the jq programs stay readable.
@@ -76,7 +77,7 @@ fi
 die() { printf 'ghfzf: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 require() {
@@ -103,6 +104,7 @@ while [ $# -gt 0 ]; do
                        [ -n "$ensure_target" ] || die "--ensure requires owner/repo"
                        ;;
         --list)        action="list" ;;
+        --fetch)       action="fetch" ;;
         --rows)        action="rows" ;;   # internal: used by ctrl-r reload
         -r|--refresh)  force_refresh=1 ;;
         --)            shift; break ;;
@@ -154,16 +156,6 @@ fi
 
 mkdir -p "$CACHE_DIR"
 
-cache_is_fresh() {
-    [ -s "$CACHE_FILE" ] || return 1
-    [ "$force_refresh" -eq 0 ] || return 1
-    local now mtime age
-    now=$(date +%s)
-    mtime=$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
-    age=$((now - mtime))
-    [ "$age" -lt "$TTL" ]
-}
-
 # Fetch every repo the authenticated user can see (owned, collaborator, org
 # member). The GraphQL `viewer.repositories` with affiliations covers all three
 # at once, with cursor-based pagination.
@@ -199,7 +191,7 @@ fetch_repos() {
     # of the template, so we use repos.XXXXXX (no .json suffix) and rely on the
     # trap below to clean up on any exit path.
     tmp=$(mktemp "$CACHE_DIR/repos.XXXXXX") || die "mktemp failed in $CACHE_DIR"
-    trap 'rm -f "$tmp"' EXIT INT TERM
+    trap 'rm -f "$tmp" "${tmp}.json"' EXIT INT TERM
     # gh api --paginate handles $endCursor automatically when the query exposes
     # a pageInfo with endCursor. Each page is a separate JSON doc; merge the
     # `nodes` arrays with jq -s.
@@ -216,9 +208,19 @@ fetch_repos() {
     trap - EXIT INT TERM
 }
 
-if ! cache_is_fresh; then
+if [ "$action" = "fetch" ]; then
+    printf 'ghfzf: fetching repo list...\n' >&2
+    fetch_repos
+    exit 0
+fi
+
+if [ "$force_refresh" -eq 1 ]; then
     printf 'ghfzf: refreshing repo cache...\n' >&2
     fetch_repos
+fi
+
+if [ ! -s "$CACHE_FILE" ]; then
+    die "repo cache not found. Run: ghfzf --fetch   (or: ghj fetch)"
 fi
 
 # Column widths for the aligned display.
